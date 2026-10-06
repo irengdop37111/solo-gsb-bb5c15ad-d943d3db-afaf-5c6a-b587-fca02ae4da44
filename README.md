@@ -54,8 +54,10 @@ pytest -q
 | `GET` | `/halls/{hall_id}/timeline` | 只取每通道可执行时间线 |
 | `GET` | `/halls/{hall_id}/state?at=...` | 模拟某时刻各通道的实际亮度/生效场景 |
 | `DELETE` | `/halls/{hall_id}` | 删除编排 |
+| `POST` | `/halls/{hall_id}/dispatch/claim` | **网关按通道领取到期指令**（租约制，顺序交付） |
+| `POST` | `/halls/{hall_id}/dispatch/ack` | **网关确认已领取任务**（匹配租约令牌，幂等） |
 
-数据为**内存存储**（线程安全，单 worker），重启清空；如需多实例持久化可将 `app/store.py` 替换为 Redis/数据库实现，`app/engine.py` 是纯函数、与存储无关。
+数据为**内存存储**（线程安全，单 worker），重启清空；派发队列与租约状态（`app/dispatch.py`）同为内存态并随存储清空。如需多实例持久化可将 `app/store.py` 替换为 Redis/数据库实现，`app/engine.py` 是纯函数、与存储无关。
 
 ### 数据模型要点
 
@@ -282,17 +284,146 @@ curl -sS -X POST http://localhost:8080/halls/batch-publish \
 
 ---
 
+## 展厅网关任务派发（领取 / 确认）
+
+场馆网关从**当前已发布版本**按通道领取到期指令、就地执行、再凭租约令牌确认。两个端点：
+
+- `POST /halls/{hall_id}/dispatch/claim` —— 领取。请求体：
+  - `channel`（可选）：只领该通道；**缺省时跨所有通道**各取队首一个任务；
+  - `limit`（必填，≥1）：本次领取数量上限；
+  - `lease_seconds`（必填，≥0）：租约时长（秒），`0` 表示立即过期。
+- `POST /halls/{hall_id}/dispatch/ack` —— 确认。请求体：`task_id` + `lease_token`。
+
+语义规则：
+
+1. **顺序交付**：每通道严格按执行时间 `at` 升序交付；**前一任务未确认前，后一任务不可领取**，因此单通道一次至多返回 1 个任务（跨通道领取时每通道至多 1 个、总数不超过 `limit`）。
+2. **到期才发**：只发放 `at <= 当前时间` 的指令；队首未到期则该通道本轮没有可领任务。
+3. **租约互斥**：租约内同一任务**不会重复发放**；租约过期后**同一 `task_id` 可重领并换发新令牌**（`task_id` 稳定不变）。
+4. **确认匹配当前令牌**：重复确认（同一 `task_id` + 同一令牌）**幂等**返回 200（`duplicate: true`）；旧令牌/错令牌返回 **409 `token_conflict`** 且不改变任何状态。
+5. **版本失效**：展厅**重新发布或删除**后，旧版本未确认任务全部失效——旧租约确认返回 **409 `version_expired`**（删除时 `current_version: null`）；**新版本不补发其发布时间之前的指令**（首版发放全部指令）。单展厅 `PUT` 与批量发布遵循同一规则；**校验失败或版本冲突的发布不改变队列**。删除后重建同名展厅也属于新一代：旧租约确认同样报告 `version_expired`（`task_id` 中的 `g<n>` 为发布代次，随每次发布/删除递增，不会与新一代撞号）。
+6. **并发安全**：领取、确认与发布（含批量）在同一锁临界区内串行，**不会出现跨版本确认**。
+
+### 10. 网关领取到期指令
+
+```bash
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery.json >/dev/null
+
+# 按通道领取（也可省略 channel 跨通道领取，limit 限制总数）
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"channel": "lamp-case-1", "limit": 5, "lease_seconds": 30}' | jq
+```
+
+```json
+{
+  "hall_id": "bronze-gallery",
+  "version": 1,
+  "count": 1,
+  "tasks": [
+    {
+      "task_id": "bronze-gallery:g1:v1:lamp-case-1:0000",
+      "hall_id": "bronze-gallery",
+      "version": 1,
+      "channel": "lamp-case-1",
+      "command": {"type": "fade", "at": "2026-10-06T08:00:00+00:00", "from_level": 0.0, "to_level": 60.0, "fade_end_at": "2026-10-06T08:05:00+00:00", "fade_seconds": 300.0, "scene_id": "morning-open", "priority": "normal"},
+      "lease_token": "sx1LvyI-dQzOFVR1lYN1dw",
+      "lease_expires_at": "2026-10-06T09:20:06.367705+00:00"
+    }
+  ]
+}
+```
+
+`command` 就是编译后时间线里的原始指令，可直接下发调光网关。前一任务未确认时再次领取返回空列表：
+
+```bash
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"channel": "lamp-case-1", "limit": 5, "lease_seconds": 30}' | jq -c '{count, tasks}'
+# => {"count":0,"tasks":[]}     （租约未过期 + 前一任务未确认）
+```
+
+### 11. 确认与重复确认（幂等）
+
+```bash
+TOKEN=sx1LvyI-dQzOFVR1lYN1dw
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/ack \
+  -H 'Content-Type: application/json' \
+  -d "{\"task_id\": \"bronze-gallery:g1:v1:lamp-case-1:0000\", \"lease_token\": \"$TOKEN\"}" | jq
+```
+
+```json
+{"ok": true, "hall_id": "bronze-gallery", "task_id": "bronze-gallery:g1:v1:lamp-case-1:0000", "version": 1, "channel": "lamp-case-1", "acknowledged": true, "duplicate": false}
+```
+
+同一请求重放仍返回 200（`duplicate: true`），游标只前进一次；确认后该通道的下一个到期指令才可领取。
+
+### 12. 租约过期重领 + 旧令牌冲突
+
+```bash
+# 用 0 秒租约模拟立即过期（实际部署用正常时长）
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/claim \
+  -H 'Content-Type: application/json' -d '{"channel": "lamp-case-2", "limit": 1, "lease_seconds": 0}' | jq -r '.tasks[0].lease_token'
+# => OLD_TOKEN
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/claim \
+  -H 'Content-Type: application/json' -d '{"channel": "lamp-case-2", "limit": 1, "lease_seconds": 300}' | jq -c '.tasks[0] | {task_id, lease_token}'
+# => {"task_id":"bronze-gallery:g1:v1:lamp-case-2:0000","lease_token":"NEW_TOKEN"}   同一 task_id，令牌已换
+
+# 用 OLD_TOKEN 确认 -> 409 token_conflict，状态不变
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/ack \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id": "bronze-gallery:g1:v1:lamp-case-2:0000", "lease_token": "OLD_TOKEN"}'
+# => {"ok": false, "code": "token_conflict", "message": "Lease token does not match the current token ...", "task_id": "..."}
+```
+
+### 13. 重新发布后：旧租约确认报告版本过期，新版本不补发
+
+```bash
+# 重新发布同一编排（版本 1 -> 2）
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery.json >/dev/null
+
+# 版本 1 的未确认任务失效：旧租约确认 -> 409 version_expired
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/ack \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id": "bronze-gallery:g1:v1:lamp-case-2:0000", "lease_token": "NEW_TOKEN"}'
+```
+
+```json
+{
+  "ok": false,
+  "code": "version_expired",
+  "message": "Task 'bronze-gallery:g1:v1:lamp-case-2:0000' was issued for hall 'bronze-gallery' version 1, but the hall is now at version 2; the outstanding task is invalidated and was not confirmed.",
+  "task_id": "bronze-gallery:g1:v1:lamp-case-2:0000",
+  "task_version": 1,
+  "current_version": 2
+}
+```
+
+```bash
+# 版本 2 不补发发布时间之前的指令（示例编排全部指令都早于重新发布时刻）
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/dispatch/claim \
+  -H 'Content-Type: application/json' -d '{"limit": 10, "lease_seconds": 60}' | jq -c '{version, count, tasks}'
+# => {"version":2,"count":0,"tasks":[]}
+```
+
+删除展厅同理：旧租约确认返回 `version_expired`（`current_version: null`），领取返回 404 `hall_not_found`。批量发布（`POST /halls/batch-publish`）与单展厅 `PUT` 遵循完全相同的失效规则；校验失败（422）或版本冲突（409）的发布不触碰队列，在租任务仍可正常确认。
+
+---
+
 ## 目录结构
 
 ```
 app/
-  models.py     # Pydantic 输入模型（含批量发布 BatchPublishIn）与时间归一化
+  models.py     # Pydantic 输入模型（含批量发布 BatchPublishIn、网关 DispatchClaimIn/DispatchAckIn）与时间归一化
   engine.py     # 纯函数：校验 + 时间线合成（抢占/恢复/跳过）
   simulator.py  # 任意时刻的通道状态模拟
   store.py      # 线程安全内存存储：单展厅 put 与批量原子 batch_commit（乐观版本检查）
-  main.py       # FastAPI 路由（单展厅 + POST /halls/batch-publish）
+  dispatch.py   # 网关任务派发：按通道顺序领取（租约制）、令牌确认、版本失效
+  main.py       # FastAPI 路由（单展厅 + 批量发布 + 网关领取/确认）
 tests/
-  test_api.py   # 33 个端到端用例（单展厅 16 + 批量发布 17，含并发）
+  test_api.py       # 34 个端到端用例（单展厅 16 + 批量发布 18，含并发）
+  test_dispatch.py  # 23 个网关派发用例（顺序/租约/确认/版本失效/并发）
 examples/
   bronze-gallery.json
   batch-publish.json   # 批量发布请求示例（更新 + 新建）

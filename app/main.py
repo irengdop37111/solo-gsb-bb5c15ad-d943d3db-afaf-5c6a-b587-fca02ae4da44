@@ -7,17 +7,20 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
-from .models import BatchPublishIn, HallIn, as_utc
+from .dispatch import board
+from .models import BatchPublishIn, DispatchAckIn, DispatchClaimIn, HallIn, as_utc
 from .simulator import simulate
 from .store import StoredHall, store
 
 app = FastAPI(
     title="Museum Lighting Orchestration API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compile scheduled light scenes into an executable per-channel timeline. "
         "Validates lamp references, brightness ranges and non-overlapping fade intervals; "
-        "emergency scenes preempt normal scenes and release only to scenes still in window."
+        "emergency scenes preempt normal scenes and release only to scenes still in window. "
+        "Venue gateways claim due commands per channel under a lease and acknowledge them "
+        "with the lease token; re-publishing invalidates unacknowledged tasks of the old version."
     ),
 )
 
@@ -293,3 +296,82 @@ def delete_hall(hall_id: str) -> Response:
             detail={"code": "hall_not_found", "message": f"Hall '{hall_id}' does not exist."},
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Gateway dispatch: claim due commands per channel, acknowledge with the lease
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/halls/{hall_id}/dispatch/claim",
+    status_code=status.HTTP_200_OK,
+    tags=["dispatch"],
+    summary="Gateway claims due commands (per channel, in order, leased)",
+)
+def claim_tasks(hall_id: str, claim: DispatchClaimIn) -> Any:
+    """Hand out due commands of the hall's current version to a venue gateway.
+
+    Per channel, commands are delivered strictly in execution-time order and
+    the next one is claimable only after the previous one is acknowledged, so
+    one claim returns at most one task per channel (up to ``limit`` in total;
+    pass ``channel`` to claim a single channel). A leased task is never issued
+    twice within its lease; after the lease expires the same ``task_id`` is
+    re-issued under a fresh ``lease_token``. Commands scheduled before the
+    current version's publish time are never re-issued.
+    """
+    result = board.claim(hall_id, claim.channel, claim.limit, claim.lease_seconds)
+    if not result["ok"]:
+        raise HTTPException(
+            status_code=result["status"],
+            detail={"code": result["code"], "message": result["message"]},
+        )
+    stored = result["stored"]
+    return {
+        "hall_id": hall_id,
+        "version": stored.version,
+        "count": len(result["tasks"]),
+        "tasks": result["tasks"],
+    }
+
+
+@app.post(
+    "/halls/{hall_id}/dispatch/ack",
+    status_code=status.HTTP_200_OK,
+    tags=["dispatch"],
+    summary="Gateway acknowledges a claimed task with its lease token",
+)
+def ack_task(hall_id: str, ack: DispatchAckIn) -> Any:
+    """Confirm a claimed task.
+
+    The acknowledgement must carry the task's current lease token. Replaying
+    the same acknowledgement is idempotent; a stale or foreign token is a 409
+    conflict that changes nothing. If the hall was re-published or deleted
+    since the task was issued, the acknowledgement is rejected as
+    ``version_expired`` (409) — tasks are never confirmed across versions.
+    """
+    result = board.ack(hall_id, ack.task_id, ack.lease_token)
+    if not result["ok"]:
+        if result["status"] == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": result["code"], "message": result["message"]},
+            )
+        return JSONResponse(
+            status_code=result["status"],
+            content={
+                "ok": False,
+                "code": result["code"],
+                "message": result["message"],
+                "task_id": ack.task_id,
+                **{k: result[k] for k in ("task_version", "current_version") if k in result},
+            },
+        )
+    record = result["record"]
+    return {
+        "ok": True,
+        "hall_id": hall_id,
+        "task_id": record.task_id,
+        "version": record.version,
+        "channel": record.channel,
+        "acknowledged": True,
+        "duplicate": result["duplicate"],
+    }

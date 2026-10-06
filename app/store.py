@@ -16,12 +16,41 @@ class StoredHall:
     created_at: datetime
     updated_at: datetime
     version: int
+    # Mutation generation of this hall. Unlike ``version`` it never resets:
+    # a delete followed by a re-create still yields a fresh epoch, so the
+    # dispatch board can tell generations apart even when version numbers
+    # coincide (re-created halls start again at version 1).
+    epoch: int
 
 
 class HallStore:
     def __init__(self) -> None:
         self._halls: dict[str, StoredHall] = {}
+        # Per-hall mutation generation; survives deletion on purpose.
+        self._epochs: dict[str, int] = {}
         self._lock = threading.RLock()
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The store-wide lock.
+
+        The dispatch board (``app/dispatch.py``) shares it so that claims and
+        acknowledgements serialise against single/batch publishes and deletes:
+        a task can never be confirmed against a version that has already been
+        replaced.
+        """
+        return self._lock
+
+    def _bump_epoch(self, hall_id: str) -> int:
+        """Advance the hall's mutation generation. Caller holds the lock."""
+        epoch = self._epochs.get(hall_id, 0) + 1
+        self._epochs[hall_id] = epoch
+        return epoch
+
+    def epoch_of(self, hall_id: str) -> int | None:
+        """Current mutation generation of a hall (``None`` if never published)."""
+        with self._lock:
+            return self._epochs.get(hall_id)
 
     @staticmethod
     def compile(spec: HallIn) -> dict:
@@ -41,6 +70,7 @@ class HallStore:
                 created_at=prev.created_at if prev else now,
                 updated_at=now,
                 version=(prev.version + 1) if prev else 1,
+                epoch=self._bump_epoch(spec.id),
             )
             self._halls[spec.id] = stored
         return stored, None
@@ -124,6 +154,7 @@ class HallStore:
                     created_at=prev.created_at if prev else now,
                     updated_at=now,
                     version=(prev.version + 1) if prev else 1,
+                    epoch=self._bump_epoch(hall_id),
                 )
                 self._halls[hall_id] = stored
                 stored_list.append(stored)
@@ -139,7 +170,12 @@ class HallStore:
 
     def delete(self, hall_id: str) -> bool:
         with self._lock:
-            return self._halls.pop(hall_id, None) is not None
+            removed = self._halls.pop(hall_id, None) is not None
+            if removed:
+                # Deleting is a mutation too: outstanding leases of the removed
+                # version must become unconfirmable (reported version_expired).
+                self._bump_epoch(hall_id)
+            return removed
 
 
 store = HallStore()

@@ -90,3 +90,36 @@ class BatchPublishIn(BaseModel):
     # A batch must contain at least one hall; duplicate hall ids are rejected
     # by the endpoint (both occurrences are reported back).
     halls: Annotated[list[BatchHallItem], Field(min_length=1)]
+
+
+class DispatchClaimIn(BaseModel):
+    """Gateway claim request: which channel (optional), how many tasks, lease.
+
+    ``channel`` narrows the claim to one channel; when omitted, the next due
+    task of every channel is eligible (still at most one per channel, capped
+    by ``limit``). ``lease_seconds`` is the hold duration after which an
+    unacknowledged task may be re-claimed under a fresh token.
+    """
+
+    channel: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=64,
+            default=None,
+            description="Claim only this channel; omit to claim across all channels.",
+            examples=["lamp-case-1"],
+        ),
+    ] = None
+    limit: Annotated[int, Field(ge=1, description="Maximum number of tasks to claim in one call.")]
+    lease_seconds: Annotated[
+        float,
+        Field(ge=0, le=31_536_000, description="Lease duration in seconds; 0 expires immediately."),
+    ]
+
+
+class DispatchAckIn(BaseModel):
+    """Gateway acknowledgement: the task id and the lease token it was claimed with."""
+
+    task_id: Annotated[str, Field(min_length=1, max_length=256)]
+    lease_token: Annotated[str, Field(min_length=1, max_length=256)]
