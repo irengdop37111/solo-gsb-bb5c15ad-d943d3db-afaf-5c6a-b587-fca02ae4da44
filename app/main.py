@@ -7,19 +7,27 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
-from .models import BatchPublishIn, HallIn, as_utc
+from .delivery import DeliveryManager
+from .models import AckIn, BatchPublishIn, ClaimIn, HallIn, as_utc
 from .simulator import simulate
 from .store import StoredHall, store
 
 app = FastAPI(
     title="Museum Lighting Orchestration API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Compile scheduled light scenes into an executable per-channel timeline. "
         "Validates lamp references, brightness ranges and non-overlapping fade intervals; "
-        "emergency scenes preempt normal scenes and release only to scenes still in window."
+        "emergency scenes preempt normal scenes and release only to scenes still in window. "
+        "Gateways claim due commands per channel under a lease and confirm them with the "
+        "current lease token; republishing or deleting a hall invalidates the old version."
     ),
 )
+
+# Publish/delete and gateway claim/confirm share the store's single lock, so a
+# confirmation can never slip across a version boundary.
+delivery = DeliveryManager(store.lock)
+store.set_listener(delivery)
 
 
 def _stored_or_404(hall_id: str) -> StoredHall:
@@ -278,6 +286,58 @@ def get_state(
     stored = _stored_or_404(hall_id)
     t = as_utc(at) if at is not None else datetime.now(timezone.utc)
     return simulate(stored.plan, t)
+
+
+@app.post(
+    "/halls/{hall_id}/commands/claim",
+    status_code=status.HTTP_200_OK,
+    tags=["gateway"],
+    summary="Claim due per-channel commands under a lease",
+)
+def claim_commands(hall_id: str, body: ClaimIn) -> Any:
+    """Hand a gateway up to ``max_count`` due commands for one hall.
+
+    Delivery is per channel in execution-time order: a channel contributes at
+    most its *head* command, and while that command is held by a live lease the
+    channel contributes nothing (the next command is blocked until the head is
+    confirmed). Each task carries a stable ``task_id``, the published
+    ``version`` it belongs to, the executable ``command`` and a ``lease`` token.
+    A live lease is never issued twice; once it expires the same task can be
+    re-claimed with a new token. An empty ``delivered`` list is a normal poll
+    (nothing due / every head still leased).
+    """
+    stored = _stored_or_404(hall_id)
+    return delivery.claim(stored, body.max_count, body.lease_seconds)
+
+
+@app.post(
+    "/halls/{hall_id}/commands/ack",
+    status_code=status.HTTP_200_OK,
+    tags=["gateway"],
+    summary="Confirm a delivered command with its current lease token",
+)
+def acknowledge_command(hall_id: str, body: AckIn) -> Any:
+    """Confirm one task. The token must be the task's current lease token.
+
+    Re-confirming the same token returns the same success (idempotent). A token
+    that timed out or was replaced by a re-claim is a 409 conflict and changes
+    nothing. A token issued under a hall version that has since been
+    republished or deleted reports 410 ``version_expired``.
+    """
+    code, payload = delivery.confirm(hall_id, body.task_id, body.lease_token)
+    if code != 200:
+        return JSONResponse(status_code=code, content=payload)
+    return payload
+
+
+@app.get(
+    "/halls/{hall_id}/delivery",
+    tags=["gateway"],
+    summary="Inspect per-channel delivery/lease state (operational view)",
+)
+def delivery_status(hall_id: str) -> dict:
+    stored = _stored_or_404(hall_id)
+    return delivery.status(stored)
 
 
 @app.delete(

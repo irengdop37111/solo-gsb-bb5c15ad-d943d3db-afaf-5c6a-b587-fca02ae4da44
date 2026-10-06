@@ -4,7 +4,7 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, delivery
 from app.store import store
 
 
@@ -18,8 +18,10 @@ def iso(y, mo, d, h, mi=0, s=0):
 @pytest.fixture(autouse=True)
 def _clear():
     store._halls.clear()
+    delivery.clear()
     yield
     store._halls.clear()
+    delivery.clear()
 
 
 def lamp(lid, default=0):

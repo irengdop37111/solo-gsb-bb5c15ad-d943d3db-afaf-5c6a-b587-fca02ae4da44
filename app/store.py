@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
+from .clock import utc_now
 from .models import HallIn
 from .engine import compile_hall
 
@@ -19,9 +20,21 @@ class StoredHall:
 
 
 class HallStore:
-    def __init__(self) -> None:
+    def __init__(self, lock: threading.RLock | None = None) -> None:
         self._halls: dict[str, StoredHall] = {}
-        self._lock = threading.RLock()
+        # Shared with the DeliveryManager so publish/delete and claim/confirm
+        # serialise in one critical section (never two locks => no deadlock).
+        self._lock = lock if lock is not None else threading.RLock()
+        # Optional listener notified on every successful persist/delete while
+        # the lock is held; set by the delivery layer during wiring.
+        self._listener: object = None
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    def set_listener(self, listener: object) -> None:
+        self._listener = listener
 
     @staticmethod
     def compile(spec: HallIn) -> dict:
@@ -32,9 +45,9 @@ class HallStore:
         plan = compile_hall(spec)
         if not plan["ok"]:
             return None, plan
-        now = datetime.now(timezone.utc)
         with self._lock:
             prev = self._halls.get(spec.id)
+            now = utc_now()
             stored = StoredHall(
                 spec=spec,
                 plan=plan,
@@ -43,6 +56,8 @@ class HallStore:
                 version=(prev.version + 1) if prev else 1,
             )
             self._halls[spec.id] = stored
+            if self._listener is not None:
+                self._listener.on_persist(stored, now)
         return stored, None
 
     @staticmethod
@@ -114,7 +129,7 @@ class HallStore:
             if conflicts or not items:
                 return None, conflicts
 
-            now = datetime.now(timezone.utc)
+            now = utc_now()
             stored_list: list[StoredHall] = []
             for hall_id, _expected, spec, plan in items:
                 prev = self._halls.get(hall_id)
@@ -127,6 +142,10 @@ class HallStore:
                 )
                 self._halls[hall_id] = stored
                 stored_list.append(stored)
+                if self._listener is not None:
+                    # Each hall in a batch gets its own version watermark at the
+                    # commit instant; old-version leases are invalidated first.
+                    self._listener.on_persist(stored, now)
         return stored_list, []
 
     def get(self, hall_id: str) -> StoredHall | None:
@@ -139,7 +158,10 @@ class HallStore:
 
     def delete(self, hall_id: str) -> bool:
         with self._lock:
-            return self._halls.pop(hall_id, None) is not None
+            existed = self._halls.pop(hall_id, None) is not None
+            if existed and self._listener is not None:
+                self._listener.on_delete(hall_id)
+            return existed
 
 
 store = HallStore()

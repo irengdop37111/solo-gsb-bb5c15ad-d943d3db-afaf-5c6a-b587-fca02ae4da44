@@ -90,3 +90,35 @@ class BatchPublishIn(BaseModel):
     # A batch must contain at least one hall; duplicate hall ids are rejected
     # by the endpoint (both occurrences are reported back).
     halls: Annotated[list[BatchHallItem], Field(min_length=1)]
+
+
+class ClaimIn(BaseModel):
+    """Gateway poll for the due commands of one hall.
+
+    The gateway identifies the hall, the maximum number of tasks to hand out in
+    this response and the lease visibility timeout. At most one task per channel
+    is ever returned (the channel head), and only when it is due.
+    """
+
+    max_count: Annotated[int, Field(ge=1, le=256, default=10, description="Upper bound on tasks returned in this claim.")] = 10
+    lease_seconds: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=86_400,
+            default=30,
+            description="Lease visibility timeout; an unacknowledged task can be re-claimed once it elapses.",
+        ),
+    ] = 30
+
+
+class AckIn(BaseModel):
+    """Confirmation of a delivered task.
+
+    Must carry the current lease token returned with the task. The same token
+    presented again is an idempotent success; an old token is a conflict and
+    leaves delivery state untouched.
+    """
+
+    task_id: Annotated[str, Field(min_length=1, max_length=160, examples=["bronze-gallery:v1:lamp-case-1:000000"])]
+    lease_token: Annotated[str, Field(min_length=1, max_length=128)]
